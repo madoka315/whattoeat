@@ -19,7 +19,9 @@ sv = Service(
     help_ = sv_help #帮助说明
     )
 
-_lmt = DailyNumberLimiter(5)
+_lmt = DailyNumberLimiter(5)      # 查询限额：每人每天 5 次
+_add_lmt = DailyNumberLimiter(5)  # 添菜限额：每人每天 5 道
+MAX_FOOD_SIZE = 8 * 1024 * 1024
 imgpath = os.path.join(os.path.expanduser(RES_DIR), 'img', 'foods')
 
 @sv.on_rex(r'^(今天|[早中午晚][上饭餐午]|夜宵)吃(什么|啥|点啥)')
@@ -31,7 +33,11 @@ async def what_to_eat(bot, ev: CQEvent):
     time = match.group(1).strip()
     food = random.choice(os.listdir(imgpath))
     name = food.split('.')
-    to_eat = f'{time}去吃{name[0]}吧~\n'
+    if '_' in name[0]:
+        name[0] = name[0].replace("_","")
+        to_eat = f'{time}去吃{name[0]}吧~\n*这个菜品是用户添加的，请不要盲目听从哦\n'
+    else:
+        to_eat = f'{time}去吃{name[0]}吧~\n'
     try:
         foodimg = R.img(f'foods/{food}').cqcode
         to_eat += str(foodimg)
@@ -44,20 +50,25 @@ async def download_async(url: str, name: str):
     resp = await aiorequests.get(url, stream=True)
     if resp.status_code != 200:
         raise ValueError(f'图片下载失败（HTTP {resp.status_code}）')
+    length = resp.headers.get('Content-Length')
+    if length and length.isdigit() and int(length) > MAX_FOOD_SIZE:
+        raise ValueError('图片太大了（上限 8MB），换一张吧~')
     content = await resp.content
-    try:
-        extension = filetype.guess_mime(content).split('/')[1]
-    except:
-        raise ValueError('不是有效文件类型')
-    abs_path = os.path.join(imgpath, f'{name}.{extension}')
+    if len(content) > MAX_FOOD_SIZE:
+        raise ValueError('图片太大了（上限 8MB），换一张吧~')
+    mime = filetype.guess_mime(content)
+    if not mime or not mime.startswith('image/'):
+        raise ValueError('这不是一张有效的图片哦')
+    extension = mime.split('/')[1]
+    # 菜名已在 add_food 校验（拒绝路径分隔符/非法字符/控制符），
+    # 拼上 `_` 前缀后不可能指向 imgpath 之外的路径
+    abs_path = os.path.join(imgpath, f'_{name}.{extension}')
     with open(abs_path, 'wb') as f:
         f.write(content)
 
 @sv.on_prefix(('添菜','添加菜品'))
 @sv.on_suffix(('添菜','添加菜品'))
 async def add_food(bot, ev: CQEvent):
-    if not priv.check_priv(ev, priv.SUPERUSER):
-        return
     food = ev.message.extract_plain_text().strip()
     # 与 __init__.py / util.py 一致：遍历消息段判断图片，
     # 而不是用正则匹配 str(ev.message)（接收到的图片 CQ 码不一定带 url 字段）
@@ -79,6 +90,10 @@ async def add_food(bot, ev: CQEvent):
     if len(food) > 60:
         await bot.send(ev,'菜名太长了（60 字以内），换一个吧~')
         return
+    uid = ev.user_id
+    if not _add_lmt.check(uid):
+        await bot.send(ev,'你今天添的菜已经够多啦，明天再来吧~', at_sender=True)
+        return
     try:
         await download_async(url, food)
     except ValueError as e:
@@ -88,4 +103,5 @@ async def add_food(bot, ev: CQEvent):
         hoshino.logger.error(f'添菜下载失败 {type(e)}: {e}')
         await bot.send(ev, '添加失败，图片可能暂时取不到，稍后再试试吧~')
         return
+    _add_lmt.increase(uid)
     await bot.send(ev,'食谱已增加~')
